@@ -13,7 +13,7 @@ from peft import get_peft_model, prepare_model_for_kbit_training
 from utils import *
 from federated_learning import *
 from config import get_config, save_config, get_model_config, get_training_args
-from red import load_RED_model, get_red_model_state_dict, set_red_model_state_dict, get_peft_model_state_dict, \
+from OpenFedLLM.red import load_RED_model, get_red_model_state_dict, set_red_model_state_dict, get_peft_model_state_dict, \
     set_red_model_params_trainable, set_peft_model_params_trainable
 
 # ===== Define the arguments =====
