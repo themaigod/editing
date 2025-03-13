@@ -1,17 +1,20 @@
 import copy
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from tqdm import tqdm
 import numpy as np
+import torch
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import DataCollatorForCompletionOnlyLM
-from peft import get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict, prepare_model_for_kbit_training
+from peft import get_peft_model, prepare_model_for_kbit_training
 
 from utils import *
 from federated_learning import *
 from config import get_config, save_config, get_model_config, get_training_args
+from red import load_RED_model, get_red_model_state_dict, set_red_model_state_dict, get_peft_model_state_dict, \
+    set_red_model_params_trainable, set_peft_model_params_trainable
 
 # ===== Define the arguments =====
 script_args, fed_args, peft_config = get_config()
@@ -44,16 +47,25 @@ if script_args.load_in_8bit or script_args.load_in_4bit:
     )
 
 model = get_peft_model(model, peft_config)
-model.print_trainable_parameters()
+set_red_model_params_trainable(model)
 
-model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+model.base_model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
 
 if training_args.gradient_checkpointing:
     model.enable_input_require_grads()
 
+model_red = load_RED_model(model)
+model_red = model_red.cuda()
+
+set_peft_model_params_trainable(model)
+
+model_red.print_trainable_parameters()
+
 # ===== Define the global and local models =====
+# global_dict = copy.deepcopy(get_peft_model_state_dict(model))
 global_dict = copy.deepcopy(get_peft_model_state_dict(model))
-local_dict_list = [copy.deepcopy(global_dict) for i in range(fed_args.num_clients)]
+# local_dict_list = [copy.deepcopy(global_dict) for i in range(fed_args.num_clients)]
+local_dict_list = [copy.deepcopy(get_red_model_state_dict(model)) for i in range(fed_args.num_clients)]
 proxy_dict, opt_proxy_dict = get_proxy_dict(fed_args, global_dict)
 global_auxiliary, auxiliary_model_list, auxiliary_delta_dict = get_auxiliary_dict(fed_args, global_dict)
 
@@ -71,6 +83,8 @@ data_collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer
 # ===== Start federated training =====
 training_loss = [[] for i in range(fed_args.num_clients)]
 
+local_dict_list_for_global = [copy.deepcopy(global_dict) for client in range(fed_args.num_clients)]
+
 for round in tqdm(range(fed_args.num_rounds)):
 
     clients_this_round = get_clients_this_round(fed_args, round)
@@ -83,7 +97,8 @@ for round in tqdm(range(fed_args.num_rounds)):
             training_loss[client].append(-1)  # -1 is an indicator of not training
             continue
 
-        set_peft_model_state_dict(model, global_dict)  # sync the global model to the local model
+        # set_peft_model_state_dict(model, global_dict)   # sync the global model to the local model
+        set_red_model_state_dict(model, global_dict, local_dict_list[client])
 
         sub_dataset = get_dataset_this_round(local_datasets[client], round, fed_args,
                                              script_args)  # get the required sub-dataset for this round
@@ -113,18 +128,26 @@ for round in tqdm(range(fed_args.num_rounds)):
         if fed_args.fed_alg == 'scaffold':
             auxiliary_model_list[client], auxiliary_delta_dict[client] = trainer.get_auxiliary_param()
 
-        local_dict_list[client] = copy.deepcopy(get_peft_model_state_dict(model))  # copy is needed!
+        local_dict_list[client] = copy.deepcopy(get_red_model_state_dict(model))  # copy is needed!
+
+        local_dict_list_for_global[client] = copy.deepcopy(get_peft_model_state_dict(model))
 
     # ===== Server aggregates the local models =====
     global_dict, global_auxiliary = global_aggregate(
-        fed_args, global_dict, local_dict_list, sample_num_list, \
+        fed_args, global_dict, local_dict_list_for_global, sample_num_list, \
         clients_this_round, round, proxy_dict=proxy_dict, \
         opt_proxy_dict=opt_proxy_dict, auxiliary_info=(global_auxiliary, auxiliary_delta_dict)
     )
-    set_peft_model_state_dict(model, global_dict)  # Update global model
+    # set_peft_model_state_dict(model, global_dict)   # Update global model
 
     # ===== Save the model =====
     if (round + 1) % fed_args.save_model_freq == 0:
-        trainer.save_model(os.path.join(script_args.output_dir, f"checkpoint-{round + 1}"))
+        # trainer.save_model(os.path.join(script_args.output_dir, f"checkpoint-{round+1}"))
+        state_dict = model.state_dict()
+        save_dict = {
+            "common": {k: state_dict[k] for k in state_dict if (k not in global_dict) or (k not in local_dict_list[0])}}
+        save_dict["global"] = global_dict
+        save_dict["local"] = local_dict_list
+        torch.save(save_dict, os.path.join(script_args.output_dir, f"checkpoint-{round + 1}"))
 
     np.save(os.path.join(script_args.output_dir, "training_loss.npy"), np.array(training_loss))
