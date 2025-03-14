@@ -1,6 +1,7 @@
 import torch
 import re
 import torch.nn as nn
+import copy
 
 
 def load_RED_model(model):
@@ -181,7 +182,8 @@ def get_red_model_state_dict(model):
 
 
 def set_red_model_state_dict(model_red, global_dict, local_dict):
-    state_dict = model_red.state_dict()
+    state_dict = {}
+
     for k in global_dict:
         state_dict[k] = global_dict[k]
     for k in local_dict:
